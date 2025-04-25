@@ -1,13 +1,13 @@
 import os
 import sys
+import re
 import pandas as pd
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                             QWidget, QLabel, QPushButton, QFileDialog, QListWidget, 
                             QComboBox, QCheckBox, QDoubleSpinBox, QTabWidget, QMessageBox, 
-                            QProgressBar, QSplitter, QLineEdit, QStatusBar, QToolButton, 
-                            QTableWidget, QTableWidgetItem, QToolBar, QAction, QGroupBox, 
-                            QMenu, QDockWidget)
+                            QProgressBar, QSplitter, QLineEdit, QStatusBar, QToolBar, QAction, 
+                            QGroupBox, QDockWidget, QTableWidget, QTableWidgetItem, QMenu)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QSize
 from PyQt5.QtGui import QIcon, QPalette, QColor, QFont
 import matplotlib.pyplot as plt
@@ -49,6 +49,9 @@ QPushButton[role="clear"] {
 QPushButton[role="plot"] {
     background-color: #FF5722;
 }
+QPushButton[role="suggest"] {
+    background-color: #2196F3;
+}
 QComboBox, QLineEdit, QDoubleSpinBox {
     background-color: #424242;
     border-radius: 4px;
@@ -59,6 +62,12 @@ QListWidget, QTableWidget {
     background-color: #353535;
     border: 1px solid #555555;
     alternate-background-color: #3A3A3A;
+}
+QListWidget::item:selected {
+    background-color: #555555;
+}
+QListWidget::item[role="suggested"] {
+    background-color: #1B5E20;
 }
 QGroupBox {
     border: 1px solid #555555;
@@ -94,15 +103,98 @@ QTabBar::tab:selected {
 }
 """
 
+class DBCParser:
+    def __init__(self):
+        self.messages = []
+        self.signals = {}
+    
+    def parse_dbc(self, file_path):
+        print(f"Parsing DBC file: {file_path}")
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        except Exception as e:
+            print(f"Error reading DBC file: {str(e)}")
+            return False
+        
+        bo_pattern = re.compile(r'BO_\s+(\d+)\s+([^\s:]+):\s+(\d+)\s+(\S+)')
+        sg_pattern = re.compile(r'SG_\s+([^\s:]+)\s*(M\s*)?(m\d+\s*)?:(?:\s*(\d+)\|(\d+)@(\d+)([+-])\s*\((-?\d*\.?\d*),\s*(-?\d*\.?\d*)\)\s*\[(-?\d*\.?\d*)\|(-?\d*\.?\d*)\]\s*"(.*?)"\s*(\S+))')
+        
+        current_message = None
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('//'):
+                continue
+            
+            bo_match = bo_pattern.match(line)
+            if bo_match:
+                frame_id = int(bo_match.group(1))
+                name = bo_match.group(2)
+                dlc = int(bo_match.group(3))
+                sender = bo_match.group(4)
+                current_message = {
+                    'frame_id': frame_id,
+                    'name': name,
+                    'dlc': dlc,
+                    'sender': sender,
+                    'signals': [],
+                    'is_multiplexed': False
+                }
+                self.messages.append(current_message)
+                self.signals[name] = []
+                print(f"Parsed message: ID=0x{frame_id:X}, Name={name}, DLC={dlc}")
+                continue
+            
+            sg_match = sg_pattern.match(line)
+            if sg_match and current_message:
+                signal_name = sg_match.group(1)
+                is_multiplexer = bool(sg_match.group(2))
+                multiplexer_id = sg_match.group(3).strip() if sg_match.group(3) else None
+                start_bit = int(sg_match.group(4))
+                length = int(sg_match.group(5))
+                byte_order = 'big' if sg_match.group(6) == '0' else 'little'
+                sign = '+' if sg_match.group(7) == '+' else '-'
+                scale = float(sg_match.group(8))
+                offset = float(sg_match.group(9))
+                min_val = float(sg_match.group(10))
+                max_val = float(sg_match.group(11))
+                unit = sg_match.group(12)
+                receiver = sg_match.group(13)
+                
+                signal = {
+                    'name': signal_name,
+                    'start_bit': start_bit,
+                    'length': length,
+                    'byte_order': byte_order,
+                    'sign': sign,
+                    'scale': scale,
+                    'offset': offset,
+                    'min': min_val,
+                    'max': max_val,
+                    'unit': unit,
+                    'receiver': receiver,
+                    'is_multiplexer': is_multiplexer,
+                    'multiplexer_ids': [multiplexer_id] if multiplexer_id else []
+                }
+                current_message['signals'].append(signal)
+                self.signals[current_message['name']].append(signal)
+                if is_multiplexer or multiplexer_id:
+                    current_message['is_multiplexed'] = True
+                print(f"Parsed signal: {current_message['name']}.{signal_name}, StartBit={start_bit}, Length={length}, Multiplexer={is_multiplexer}, MuxID={multiplexer_id}")
+        
+        print(f"Parsed {len(self.messages)} messages with signals: {list(self.signals.keys())}")
+        return True
+
 class LogLoaderThread(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(pd.DataFrame, dict)
     error = pyqtSignal(str)
     
-    def __init__(self, file_path, db):
+    def __init__(self, file_path, db, custom_parser):
         super().__init__()
         self.file_path = file_path
         self.db = db
+        self.custom_parser = custom_parser
     
     def run(self):
         try:
@@ -308,6 +400,7 @@ class CANAnalyzerApp(QMainWindow):
         
         self.dbc_file = None
         self.db = None
+        self.custom_parser = DBCParser()
         self.log_file = None
         self.log_data = None
         self.signals_data = {}
@@ -340,7 +433,8 @@ class CANAnalyzerApp(QMainWindow):
         plot_action = QAction(QIcon("plot.png"), "Plot", self)
         plot_action.setToolTip("Plot signals (Ctrl+P)")
         plot_action.triggered.connect(self.plot_signals)
-        plot_action.setShortcut("Ctrl+P ''
+        plot_action.setShortcut("Ctrl+P")
+        self.toolbar.addAction(plot_action)
         
         export_action = QAction(QIcon("export.png"), "Export", self)
         export_action.setToolTip("Export plot/data")
@@ -473,7 +567,16 @@ class CANAnalyzerApp(QMainWindow):
         self.signal_list.customContextMenuRequested.connect(self.show_signal_context_menu)
         self.signals_layout.addWidget(self.signal_list)
         
-       subs_layout.addWidget(self.clear_signal_btn)
+        self.suggest_signals_btn = QPushButton("Suggest Signals")
+        self.suggest_signals_btn.setProperty("role", "suggest")
+        self.suggest_signals_btn.setToolTip("Suggest signals with data in log")
+        self.suggest_signals_btn.clicked.connect(self.suggest_signals)
+        self.signals_layout.addWidget(self.suggest_signals_btn)
+        
+        self.clear_signal_btn = QPushButton("Clear Signals")
+        self.clear_signal_btn.setProperty("role", "clear")
+        self.clear_signal_btn.clicked.connect(self.clear_signals)
+        self.signals_layout.addWidget(self.clear_signal_btn)
         
         self.control_tabs.addTab(self.signals_widget, "Signals")
         
@@ -729,21 +832,35 @@ class CANAnalyzerApp(QMainWindow):
         
         if file_path:
             try:
+                # Try cantools first
                 self.db = cantools.database.load_file(file_path)
                 self.dbc_file = file_path
                 self.dbc_label.setText(os.path.basename(file_path))
                 self.dbc_status.setText("DBC: Loaded")
                 self.dbc_status.setStyleSheet("color: #4CAF50; font-size: 12px;")
-                self.populate_message_list()
-                print("DBC messages:", [f"0x{m.frame_id:X} - {m.name}" for m in self.db.messages])
-                QMessageBox.information(self, "Success", "DBC file loaded successfully!")
-                self.update_status("DBC file loaded")
+                print("DBC loaded via cantools")
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load DBC file:\n{str(e)}")
-                self.update_status("Failed to load DBC file")
+                print(f"cantools failed to load DBC: {str(e)}")
+                # Fallback to custom parser
+                if self.custom_parser.parse_dbc(file_path):
+                    self.dbc_file = file_path
+                    self.dbc_label.setText(os.path.basename(file_path))
+                    self.dbc_status.setText("DBC: Loaded (Custom)")
+                    self.dbc_status.setStyleSheet("color: #4CAF50; font-size: 12px;")
+                    print("DBC loaded via custom parser")
+                else:
+                    raise ValueError("Failed to parse DBC file with custom parser")
+            
+            self.populate_message_list()
+            print("DBC messages:", [f"0x{m.frame_id:X} - {m.name}" for m in self.db.messages])
+            QMessageBox.information(self, "Success", "DBC file loaded successfully!")
+            self.update_status("DBC file loaded")
+            if self.log_data is not None:
+                self.load_log_file(self.log_file)
     
     def clear_dbc(self):
         self.db = None
+        self.custom_parser = DBCParser()
         self.dbc_file = None
         self.dbc_label.setText("No DBC file loaded")
         self.dbc_status.setText("DBC: None")
@@ -769,7 +886,7 @@ class CANAnalyzerApp(QMainWindow):
             self.progress_bar.setValue(0)
             self.update_status("Loading log file...")
             
-            self.loader_thread = LogLoaderThread(file_path, self.db)
+            self.loader_thread = LogLoaderThread(file_path, self.db, self.custom_parser)
             self.loader_thread.progress.connect(self.progress_bar.setValue)
             self.loader_thread.finished.connect(self.on_log_loaded)
             self.loader_thread.error.connect(self.on_log_error)
@@ -853,6 +970,9 @@ class CANAnalyzerApp(QMainWindow):
                         signals_found = True
                         print(f"Added signal: {prefix}{signal_key}, Multiplexer IDs: {signal.multiplexer_ids}, Is Multiplexer: {signal.is_multiplexer}")
                         item_a = self.signal_list.item(self.signal_list.count() - 1)
+                        if signal_key in self.signals_data and not self.signals_data[signal_key].empty:
+                            item_a.setData(Qt.UserRole, "suggested")
+                            item_a.setBackground(QColor("#1B5E20"))
                         if signal.multiplexer_ids:
                             font = item_a.font()
                             font.setBold(True)
@@ -871,12 +991,57 @@ class CANAnalyzerApp(QMainWindow):
                     self.signal_list.addItem(signal_key)
                     signals_found = True
                     print(f"Added signal: {signal_key}")
+                    item_a = self.signal_list.item(self.signal_list.count() - 1)
+                    if signal_key in self.signals_data and not self.signals_data[signal_key].empty:
+                        item_a.setData(Qt.UserRole, "suggested")
+                        item_a.setBackground(QColor("#1B5E20"))
         
         if not signals_found:
             QMessageBox.warning(self, "Warning", "No signals found for selected messages!")
             self.update_status("No signals available for selected messages")
         else:
             print("Signals populated:", [self.signal_list.item(i).text() for i in range(self.signal_list.count())])
+    
+    def suggest_signals(self):
+        if not self.signals_data or not self.db:
+            QMessageBox.warning(self, "Warning", "Load a log file and DBC file first!")
+            return
+        
+        self.signal_list.clear()
+        selected_items = self.message_list.selectedItems()
+        if not selected_items:
+            self.update_status("No messages selected for signal suggestion")
+            return
+        
+        signals_found = False
+        for item in selected_items:
+            msg_id = int(item.text().split(' ')[0][2:], 16)
+            try:
+                message = self.db.get_message_by_frame_id(msg_id)
+                print(f"Suggesting signals for {message.name} (ID 0x{msg_id:X})")
+                for signal in message.signals:
+                    signal_key = f"{message.name}.{signal.name}"
+                    if signal_key in self.signals_data and not self.signals_data[signal_key].empty:
+                        prefix = "[PDU] " if signal.multiplexer_ids else ""
+                        self.signal_list.addItem(f"{prefix}{signal_key}")
+                        signals_found = True
+                        print(f"Suggested signal: {prefix}{signal_key}, Data points: {len(self.signals_data[signal_key])}")
+                        item_a = self.signal_list.item(self.signal_list.count() - 1)
+                        item_a.setData(Qt.UserRole, "suggested")
+                        item_a.setBackground(QColor("#1B5E20"))
+                        if signal.multiplexer_ids:
+                            font = item_a.font()
+                            font.setBold(True)
+                            item_a.setFont(font)
+            except KeyError:
+                print(f"No DBC message found for ID 0x{msg_id:X}")
+                continue
+        
+        if not signals_found:
+            QMessageBox.warning(self, "Warning", "No signals with data found for selected messages!")
+            self.update_status("No plottable signals found")
+        else:
+            self.update_status("Suggested signals with available data")
     
     def clear_messages(self):
         self.message_list.clear()
