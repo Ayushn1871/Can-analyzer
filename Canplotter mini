@@ -1,0 +1,86 @@
+import cantools
+import can
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import random
+import tkinter as tk
+from tkinter import filedialog
+
+# --- Browse for DBC and Log Files ---
+root = tk.Tk()
+root.withdraw()
+
+print("Select DBC file:")
+DBC_FILE = filedialog.askopenfilename(filetypes=[("DBC files", "*.dbc")])
+
+print("Select CAN log file:")
+CAN_LOG_FILE = filedialog.askopenfilename(filetypes=[("CAN log files", "*.log;*.blf;*.asc")])
+
+TARGET_MESSAGE_NAME = input("Enter the target message (PDU) name: ")
+
+# --- Load the DBC ---
+db = cantools.database.load_file(DBC_FILE)
+
+# --- Read CAN log ---
+log = can.BLFReader(CAN_LOG_FILE) if CAN_LOG_FILE.endswith('.blf') else can.ASCReader(CAN_LOG_FILE)
+
+# Find the first message of interest
+message = None
+for msg in log:
+    try:
+        decoded = db.decode_message(msg.arbitration_id, msg.data)
+        frame = db.get_message_by_frame_id(msg.arbitration_id)
+        if frame.name == TARGET_MESSAGE_NAME:
+            message = msg
+            break
+    except Exception:
+        continue
+
+if not message:
+    raise ValueError(f"Message '{TARGET_MESSAGE_NAME}' not found in the log!")
+
+# --- Prepare Visualization ---
+frame = db.get_message_by_frame_id(message.arbitration_id)
+signals = frame.signals
+
+# Create a bit array from the raw message data
+message_bits = []
+for byte in message.data:
+    for i in range(8):
+        message_bits.append((byte >> i) & 0x1)  # Little endian bit order
+
+# Assign random colors to each signal
+def random_color():
+    return (random.random(), random.random(), random.random())
+
+signal_colors = {sig.name: random_color() for sig in signals}
+
+# Plot
+fig, ax = plt.subplots(figsize=(20, 4))
+ax.set_xlim(0, len(message_bits))
+ax.set_ylim(0, 1)
+ax.axis('off')
+
+# Draw all bits
+for bit_index in range(len(message_bits)):
+    rect = patches.Rectangle((bit_index, 0), 1, 1, edgecolor='black', facecolor='white')
+    ax.add_patch(rect)
+
+# Highlight each signal
+for sig in signals:
+    start_bit = sig.start
+    length = sig.length
+    for i in range(length):
+        bit_pos = start_bit - i if sig.byte_order == 'little_endian' else start_bit + i
+        if 0 <= bit_pos < len(message_bits):
+            rect = patches.Rectangle((bit_pos, 0), 1, 1, edgecolor='black', facecolor=signal_colors[sig.name])
+            ax.add_patch(rect)
+
+# Label signals
+for sig in signals:
+    start_bit = sig.start
+    ax.text(start_bit + 0.5, 1.05, sig.name, rotation=90, fontsize=7, ha='center', va='bottom')
+
+plt.title(f'CAN Frame Layout: {TARGET_MESSAGE_NAME}', fontsize=14)
+plt.tight_layout()
+plt.show()
