@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import random
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, simpledialog
 
 # --- Browse for DBC and Log Files ---
 root = tk.Tk()
@@ -16,10 +16,17 @@ DBC_FILE = filedialog.askopenfilename(filetypes=[("DBC files", "*.dbc")])
 print("Select CAN log file:")
 CAN_LOG_FILE = filedialog.askopenfilename(filetypes=[("CAN log files", "*.log;*.blf;*.asc")])
 
-TARGET_MESSAGE_NAME = input("Enter the target message (PDU) name: ")
-
 # --- Load the DBC ---
 db = cantools.database.load_file(DBC_FILE)
+
+# List available messages
+available_messages = [msg.name for msg in db.messages]
+
+# Ask user to select a message from the available list
+TARGET_MESSAGE_NAME = simpledialog.askstring("Select Message", f"Available Messages:\n{chr(10).join(available_messages)}\n\nEnter the exact message name:")
+
+if TARGET_MESSAGE_NAME not in available_messages:
+    raise ValueError(f"Message '{TARGET_MESSAGE_NAME}' not found in the DBC!")
 
 # --- Read CAN log ---
 log = can.BLFReader(CAN_LOG_FILE) if CAN_LOG_FILE.endswith('.blf') else can.ASCReader(CAN_LOG_FILE)
