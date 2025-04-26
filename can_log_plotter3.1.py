@@ -107,6 +107,7 @@ class DBCParser:
     def __init__(self):
         self.messages = []
         self.signals = {}
+        self.bit_map = {}  # Track bit usage for overlap detection
     
     def parse_dbc(self, file_path):
         print(f"Parsing DBC file: {file_path}")
@@ -121,6 +122,7 @@ class DBCParser:
         sg_pattern = re.compile(r'SG_\s+([^\s:]+)\s*(M\s*)?(m\d+\s*)?:(?:\s*(\d+)\|(\d+)@(\d+)([+-])\s*\((-?\d*\.?\d*),\s*(-?\d*\.?\d*)\)\s*\[(-?\d*\.?\d*)\|(-?\d*\.?\d*)\]\s*"(.*?)"\s*(\S+))')
         
         current_message = None
+        signal_counts = {}  # Track signal names to handle duplicates
         for line in lines:
             line = line.strip()
             if not line or line.startswith('//'):
@@ -142,6 +144,8 @@ class DBCParser:
                 }
                 self.messages.append(current_message)
                 self.signals[name] = []
+                self.bit_map[frame_id] = [False] * (dlc * 8)
+                signal_counts[name] = {}
                 print(f"Parsed message: ID=0x{frame_id:X}, Name={name}, DLC={dlc}")
                 continue
             
@@ -161,6 +165,25 @@ class DBCParser:
                 unit = sg_match.group(12)
                 receiver = sg_match.group(13)
                 
+                # Handle duplicate signal names
+                msg_name = current_message['name']
+                if signal_name in signal_counts[msg_name]:
+                    signal_counts[msg_name][signal_name] += 1
+                    signal_name = f"{signal_name}_{signal_counts[msg_name][signal_name]}"
+                else:
+                    signal_counts[msg_name][signal_name] = 0
+                
+                # Validate bit positions
+                if start_bit + length > current_message['dlc'] * 8:
+                    print(f"Warning: Signal {msg_name}.{signal_name} exceeds message length (Start={start_bit}, Length={length}, DLC={current_message['dlc']})")
+                
+                # Check for bit overlaps
+                frame_id = current_message['frame_id']
+                for bit in range(start_bit, start_bit + length):
+                    if self.bit_map[frame_id][bit]:
+                        print(f"Warning: Bit {bit} in {msg_name}.{signal_name} overlaps with another signal")
+                    self.bit_map[frame_id][bit] = True
+                
                 signal = {
                     'name': signal_name,
                     'start_bit': start_bit,
@@ -177,10 +200,10 @@ class DBCParser:
                     'multiplexer_ids': [multiplexer_id] if multiplexer_id else []
                 }
                 current_message['signals'].append(signal)
-                self.signals[current_message['name']].append(signal)
+                self.signals[msg_name].append(signal)
                 if is_multiplexer or multiplexer_id:
                     current_message['is_multiplexed'] = True
-                print(f"Parsed signal: {current_message['name']}.{signal_name}, StartBit={start_bit}, Length={length}, Multiplexer={is_multiplexer}, MuxID={multiplexer_id}")
+                print(f"Parsed signal: {msg_name}.{signal_name}, StartBit={start_bit}, Length={length}, Multiplexer={is_multiplexer}, MuxID={multiplexer_id}")
         
         print(f"Parsed {len(self.messages)} messages with signals: {list(self.signals.keys())}")
         return True
@@ -236,8 +259,17 @@ class LogLoaderThread(QThread):
                         data_str = ' '.join(f'{b:02X}' for b in msg.data)
                         print(f"Processing ID 0x{msg.arbitration_id:X}, Timestamp: {msg.timestamp:.6f}, DLC: {msg.dlc}, Data: {data_str}")
                         
+                        if msg.dlc != message.length:
+                            print(f"Warning: Message DLC {msg.dlc} does not match DBC DLC {message.length} for {message.name}")
+                        
                         try:
-                            decoded = message.decode(msg.data, decode_choices=False, allow_truncated=True, scaling=True, allow_excess=True)
+                            decoded = message.decode(
+                                msg.data,
+                                decode_choices=False,
+                                allow_truncated=True,
+                                scaling=True,
+                                allow_excess=True
+                            )
                             print(f"Decoded {message.name} (ID 0x{msg.arbitration_id:X}): {decoded}")
                             
                             for signal_name, value in decoded.items():
@@ -255,8 +287,11 @@ class LogLoaderThread(QThread):
                             if message.is_multiplexed():
                                 print(f"Multiplexed message: {message.name}")
                                 for signal in message.signals:
-                                    if signal.is_multiplexer or signal.multiplexer_ids:
-                                        print(f"Signal {signal.name}: Multiplexer={signal.is_multiplexer}, IDs={signal.multiplexer_ids}")
+                                    if signal.is_multiplexer:
+                                        mux_value = decoded.get(signal.name, None)
+                                        print(f"Multiplexer {signal.name}: Value={mux_value}")
+                                    elif signal.multiplexer_ids:
+                                        print(f"Signal {signal.name}: Multiplexer IDs={signal.multiplexer_ids}")
                         except Exception as decode_error:
                             print(f"Decoding failed for {message.name} (ID 0x{msg.arbitration_id:X}): {str(decode_error)}")
                     except KeyError:
@@ -276,8 +311,10 @@ class LogLoaderThread(QThread):
                     self.progress.emit(min(100, int((processed_messages / total_messages) * 100)))
             
             df = pd.DataFrame(messages)
-            signals_data = {key: pd.DataFrame(data, columns=['timestamp', 'value']) 
-                           for key, data in signals_data.items()}
+            signals_data = {
+                key: pd.DataFrame(data, columns=['timestamp', 'value'])
+                for key, data in signals_data.items() if data
+            }
             print(f"Processed {processed_messages} messages, decoded {len(signals_data)} signals")
             print(f"Signal keys: {list(signals_data.keys())}")
             for key, data in signals_data.items():
@@ -832,7 +869,6 @@ class CANAnalyzerApp(QMainWindow):
         
         if file_path:
             try:
-                # Try cantools first
                 self.db = cantools.database.load_file(file_path)
                 self.dbc_file = file_path
                 self.dbc_label.setText(os.path.basename(file_path))
@@ -841,7 +877,6 @@ class CANAnalyzerApp(QMainWindow):
                 print("DBC loaded via cantools")
             except Exception as e:
                 print(f"cantools failed to load DBC: {str(e)}")
-                # Fallback to custom parser
                 if self.custom_parser.parse_dbc(file_path):
                     self.dbc_file = file_path
                     self.dbc_label.setText(os.path.basename(file_path))
@@ -958,6 +993,8 @@ class CANAnalyzerApp(QMainWindow):
         
         signals_found = False
         if self.db:
+            available_signals = list(self.signals_data.keys()) if self.signals_data else []
+            print(f"Available signals in log: {available_signals}")
             for item in selected_items:
                 msg_id = int(item.text().split(' ')[0][2:], 16)
                 try:
@@ -965,18 +1002,20 @@ class CANAnalyzerApp(QMainWindow):
                     print(f"Populating signals for {message.name} (ID 0x{msg_id:X})")
                     for signal in message.signals:
                         signal_key = f"{message.name}.{signal.name}"
-                        prefix = "[PDU] " if signal.multiplexer_ids else ""
-                        self.signal_list.addItem(f"{prefix}{signal_key}")
-                        signals_found = True
-                        print(f"Added signal: {prefix}{signal_key}, Multiplexer IDs: {signal.multiplexer_ids}, Is Multiplexer: {signal.is_multiplexer}")
-                        item_a = self.signal_list.item(self.signal_list.count() - 1)
                         if signal_key in self.signals_data and not self.signals_data[signal_key].empty:
+                            prefix = "[PDU] " if signal.multiplexer_ids else ""
+                            self.signal_list.addItem(f"{prefix}{signal_key}")
+                            signals_found = True
+                            print(f"Added signal: {prefix}{signal_key}, Multiplexer IDs: {signal.multiplexer_ids}, Is Multiplexer: {signal.is_multiplexer}, Data points: {len(self.signals_data[signal_key])}")
+                            item_a = self.signal_list.item(self.signal_list.count() - 1)
                             item_a.setData(Qt.UserRole, "suggested")
                             item_a.setBackground(QColor("#1B5E20"))
-                        if signal.multiplexer_ids:
-                            font = item_a.font()
-                            font.setBold(True)
-                            item_a.setFont(font)
+                            if signal.multiplexer_ids:
+                                font = item_a.font()
+                                font.setBold(True)
+                                item_a.setFont(font)
+                        else:
+                            print(f"Signal {signal_key} skipped: Not in log data or empty")
                     if message.is_multiplexed():
                         print(f"Multiplexed message {message.name} detected")
                 except KeyError:
@@ -988,17 +1027,21 @@ class CANAnalyzerApp(QMainWindow):
                 max_dlc = self.log_data[self.log_data['arbitration_id'] == arb_id]['dlc'].max()
                 for i in range(max_dlc):
                     signal_key = f"ID_0x{arb_id:X}.Byte{i}"
-                    self.signal_list.addItem(signal_key)
-                    signals_found = True
-                    print(f"Added signal: {signal_key}")
-                    item_a = self.signal_list.item(self.signal_list.count() - 1)
                     if signal_key in self.signals_data and not self.signals_data[signal_key].empty:
+                        self.signal_list.addItem(signal_key)
+                        signals_found = True
+                        print(f"Added signal: {signal_key}, Data points: {len(self.signals_data[signal_key])}")
+                        item_a = self.signal_list.item(self.signal_list.count() - 1)
                         item_a.setData(Qt.UserRole, "suggested")
                         item_a.setBackground(QColor("#1B5E20"))
+                    else:
+                        print(f"Signal {signal_key} skipped: Not in log data or empty")
         
         if not signals_found:
-            QMessageBox.warning(self, "Warning", "No signals found for selected messages!")
-            self.update_status("No signals available for selected messages")
+            available_signals = list(self.signals_data.keys()) if self.signals_data else []
+            warning_msg = f"No signals with data found for selected messages!\nAvailable signals in log: {available_signals or 'None'}"
+            QMessageBox.warning(self, "Warning", warning_msg)
+            self.update_status("No plottable signals found")
         else:
             print("Signals populated:", [self.signal_list.item(i).text() for i in range(self.signal_list.count())])
     
@@ -1014,6 +1057,8 @@ class CANAnalyzerApp(QMainWindow):
             return
         
         signals_found = False
+        available_signals = list(self.signals_data.keys())
+        print(f"Available signals in log: {available_signals}")
         for item in selected_items:
             msg_id = int(item.text().split(' ')[0][2:], 16)
             try:
@@ -1033,12 +1078,15 @@ class CANAnalyzerApp(QMainWindow):
                             font = item_a.font()
                             font.setBold(True)
                             item_a.setFont(font)
+                    else:
+                        print(f"Signal {signal_key} skipped: No data or not in signals_data")
             except KeyError:
                 print(f"No DBC message found for ID 0x{msg_id:X}")
                 continue
         
         if not signals_found:
-            QMessageBox.warning(self, "Warning", "No signals with data found for selected messages!")
+            warning_msg = f"No signals with data found for selected messages!\nAvailable signals in log: {available_signals or 'None'}"
+            QMessageBox.warning(self, "Warning", warning_msg)
             self.update_status("No plottable signals found")
         else:
             self.update_status("Suggested signals with available data")
@@ -1131,15 +1179,17 @@ class CANAnalyzerApp(QMainWindow):
         missing_signals = []
         for s in selected_signals:
             clean_signal = s.replace('[PDU] ', '')
-            if clean_signal in self.signals_data:
+            if clean_signal in self.signals_data and not self.signals_data[clean_signal].empty:
                 valid_signals.append(clean_signal)
             else:
                 missing_signals.append(clean_signal)
         
         if missing_signals:
-            print(f"Missing signals in signals_data: {missing_signals}")
+            print(f"Missing or empty signals: {missing_signals}")
         if not valid_signals:
-            QMessageBox.warning(self, "Warning", f"No data available for selected signals!\nSelected: {selected_signals}\nAvailable: {list(self.signals_data.keys())}")
+            available_signals = list(self.signals_data.keys()) if self.signals_data else []
+            warning_msg = f"No data available for selected signals!\nSelected: {selected_signals}\nAvailable: {available_signals or 'None'}"
+            QMessageBox.warning(self, "Warning", warning_msg)
             return
             
         color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
@@ -1190,8 +1240,12 @@ class CANAnalyzerApp(QMainWindow):
                     start_time = min(all_timestamps)
                     end_time = max(all_timestamps)
                     print(f"Fallback time range: {start_time} to {end_time}")
+                    self.start_time_spin.setValue(start_time)
+                    self.end_time_spin.setValue(end_time)
                 else:
-                    QMessageBox.warning(self, "Warning", "No data points available for selected signals!")
+                    available_signals = list(self.signals_data.keys()) if self.signals_data else []
+                    warning_msg = f"No data points available for selected signals!\nAvailable signals: {available_signals or 'None'}"
+                    QMessageBox.warning(self, "Warning", warning_msg)
                     return
             time_range = (start_time, end_time)
         
