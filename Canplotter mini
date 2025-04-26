@@ -123,6 +123,12 @@ def plot_signal_over_time(frame_name, signal_name):
         print(f"Frame {frame_name} not found in DBC.")
         return
 
+    # Find the signal to get its choices (if any)
+    signal = next((sig for sig in frame.signals if sig.name == signal_name), None)
+    if not signal:
+        print(f"Signal {signal_name} not found in frame {frame_name}.")
+        return
+
     # Reload log for iterative processing
     try:
         if CAN_LOG_FILE.endswith('.blf'):
@@ -138,10 +144,16 @@ def plot_signal_over_time(frame_name, signal_name):
     for msg in log:
         try:
             if msg.arbitration_id == frame.frame_id:
-                decoded = frame.decode(msg.data, decode_choices=True)
+                # Decode without choices to get numeric values
+                decoded = frame.decode(msg.data, decode_choices=False)
                 if signal_name in decoded:
-                    timestamps.append(msg.timestamp)
-                    values.append(decoded[signal_name])
+                    value = decoded[signal_name]
+                    # Ensure value is numeric
+                    if isinstance(value, (int, float)):
+                        timestamps.append(msg.timestamp)
+                        values.append(value)
+                    else:
+                        print(f"Skipping non-numeric value for {signal_name}: {value}")
         except Exception as e:
             continue
 
@@ -150,12 +162,15 @@ def plot_signal_over_time(frame_name, signal_name):
         plt.plot(timestamps, values, '-o', label=signal_name)
         plt.xlabel('Time (s)')
         plt.ylabel(signal_name)
+        # Add unit if defined in DBC
+        unit = signal.unit if signal.unit else "Raw Value"
+        plt.ylabel(f"{signal_name} ({unit})")
         plt.title(f'Signal: {signal_name} in Frame: {frame_name}')
         plt.legend()
         plt.grid(True)
         plt.show()
     else:
-        print(f"No data found for signal {signal_name} in frame {frame_name}")
+        print(f"No valid numeric data found for signal {signal_name} in frame {frame_name}")
 
 # --- GUI Setup ---
 class CANAnalyzerApp:
