@@ -4,57 +4,86 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import random
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, ttk
+import os
 
-# --- Browse for DBC and Log Files ---
-root = tk.Tk()
-root.withdraw()
+# --- Global Variables ---
+db = None
+log_dict = {}
+CAN_LOG_FILE = ""
 
-print("Select DBC file:")
-DBC_FILE = filedialog.askopenfilename(filetypes=[("DBC files", "*.dbc")])
+# --- File Loading Functions ---
+def load_dbc_file():
+    """Load a DBC file using cantools."""
+    global db
+    file_path = filedialog.askopenfilename(filetypes=[("DBC files", "*.dbc")])
+    if not file_path:
+        print("No DBC file selected.")
+        return False
+    try:
+        db = cantools.database.load_file(file_path)
+        print(f"Loaded DBC: {os.path.basename(file_path)}")
+        return True
+    except Exception as e:
+        print(f"Error loading DBC file: {e}")
+        return False
 
-print("Select CAN log file:")
-CAN_LOG_FILE = filedialog.askopenfilename(filetypes=[("CAN log files", "*.log;*.blf;*.asc")])
+def load_can_log():
+    """Load a CAN log file (BLF or ASC) and preprocess into a dictionary."""
+    global log_dict, CAN_LOG_FILE
+    CAN_LOG_FILE = filedialog.askopenfilename(filetypes=[("CAN log files", "*.blf;*.asc")])
+    if not CAN_LOG_FILE:
+        print("No CAN log file selected.")
+        return False
+    try:
+        if CAN_LOG_FILE.endswith('.blf'):
+            reader = can.BLFReader(CAN_LOG_FILE)
+        elif CAN_LOG_FILE.endswith('.asc'):
+            reader = can.ASCReader(CAN_LOG_FILE)
+        else:
+            print("Unsupported file format.")
+            return False
+        
+        log_dict.clear()
+        for msg in reader:
+            if msg.arbitration_id not in log_dict:
+                log_dict[msg.arbitration_id] = msg
+        print(f"Loaded CAN log: {os.path.basename(CAN_LOG_FILE)}")
+        return True
+    except Exception as e:
+        print(f"Error reading CAN log file: {e}")
+        return False
 
-# --- Load the DBC ---
-db = cantools.database.load_file(DBC_FILE)
-
-# --- Read CAN log into memory ---
-if CAN_LOG_FILE.endswith('.blf'):
-    log = list(can.BLFReader(CAN_LOG_FILE))
-else:
-    log = list(can.ASCReader(CAN_LOG_FILE))
-
-# --- Prepare Visualization for each message ---
+# --- Visualization Functions ---
 def random_color():
+    """Generate a random RGB color."""
     return (random.random(), random.random(), random.random())
 
-for frame in db.messages:
-    # Find the first matching message in log
-    message = None
-    for msg in log:
-        try:
-            frame_from_log = db.get_message_by_frame_id(msg.arbitration_id)
-            if frame_from_log.name == frame.name:
-                message = msg
-                break
-        except Exception:
-            continue
+def visualize_frame(frame_name):
+    """Visualize the bit layout of a CAN frame."""
+    if not db or not log_dict:
+        print("DBC or log not loaded.")
+        return
 
+    frame = next((f for f in db.messages if f.name == frame_name), None)
+    if not frame:
+        print(f"Frame {frame_name} not found in DBC.")
+        return
+
+    message = log_dict.get(frame.frame_id)
     if not message:
-        continue
+        print(f"No message found for frame: {frame_name}")
+        return
 
     signals = frame.signals
-
-    # Create a bit array from the raw message data
     message_bits = []
     for byte in message.data:
-        for i in range(8):
-            message_bits.append((byte >> i) & 0x1)  # Little endian bit order
+        for i in range(7, -1, -1):  # Big-endian bit order within byte
+            message_bits.append((byte >> i) & 0x1)
 
     signal_colors = {sig.name: random_color() for sig in signals}
 
-    fig, ax = plt.subplots(figsize=(20, 4))
+    fig, ax = plt.subplots(figsize=(max(10, len(message_bits) * 0.3), 4))
     ax.set_xlim(0, len(message_bits))
     ax.set_ylim(0, 1)
     ax.axis('off')
@@ -77,8 +106,120 @@ for frame in db.messages:
     # Label signals
     for sig in signals:
         start_bit = sig.start
-        ax.text(start_bit + 0.5, 1.05, sig.name, rotation=90, fontsize=7, ha='center', va='bottom')
+        ax.text(start_bit + 0.5, 1.05, sig.name, rotation=45, fontsize=max(5, 10 - len(signals) * 0.2), ha='center', va='bottom')
 
-    plt.title(f'CAN Frame Layout: {frame.name}', fontsize=14)
+    plt.title(f'CAN Frame Layout: {frame_name}', fontsize=14)
     plt.tight_layout()
     plt.show()
+
+def plot_signal_over_time(frame_name, signal_name):
+    """Plot a signal's values over time from the CAN log."""
+    if not db or not CAN_LOG_FILE:
+        print("DBC or log not loaded.")
+        return
+
+    frame = next((f for f in db.messages if f.name == frame_name), None)
+    if not frame:
+        print(f"Frame {frame_name} not found in DBC.")
+        return
+
+    # Reload log for iterative processing
+    try:
+        if CAN_LOG_FILE.endswith('.blf'):
+            log = can.BLFReader(CAN_LOG_FILE)
+        else:
+            log = can.ASCReader(CAN_LOG_FILE)
+    except Exception as e:
+        print(f"Error reading CAN log: {e}")
+        return
+
+    timestamps = []
+    values = []
+    for msg in log:
+        try:
+            if msg.arbitration_id == frame.frame_id:
+                decoded = frame.decode(msg.data, decode_choices=True)
+                if signal_name in decoded:
+                    timestamps.append(msg.timestamp)
+                    values.append(decoded[signal_name])
+        except Exception as e:
+            continue
+
+    if timestamps:
+        plt.figure(figsize=(10, 4))
+        plt.plot(timestamps, values, '-o', label=signal_name)
+        plt.xlabel('Time (s)')
+        plt.ylabel(signal_name)
+        plt.title(f'Signal: {signal_name} in Frame: {frame_name}')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+    else:
+        print(f"No data found for signal {signal_name} in frame {frame_name}")
+
+# --- GUI Setup ---
+class CANAnalyzerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("CAN Log Analyzer")
+        self.root.geometry("400x300")
+
+        # Frame and Signal selection
+        self.frame_var = tk.StringVar()
+        self.signal_var = tk.StringVar()
+
+        tk.Button(self.root, text="Load DBC File", command=self.load_dbc).pack(pady=5)
+        tk.Button(self.root, text="Load CAN Log", command=load_can_log).pack(pady=5)
+
+        tk.Label(self.root, text="Select Frame:").pack(pady=5)
+        self.frame_dropdown = ttk.Combobox(self.root, textvariable=self.frame_var, state='disabled')
+        self.frame_dropdown.pack(pady=5)
+
+        tk.Label(self.root, text="Select Signal:").pack(pady=5)
+        self.signal_dropdown = ttk.Combobox(self.root, textvariable=self.signal_var, state='disabled')
+        self.signal_dropdown.pack(pady=5)
+
+        tk.Button(self.root, text="Visualize Frame Layout", command=self.visualize).pack(pady=5)
+        tk.Button(self.root, text="Plot Signal Over Time", command=self.plot_signal).pack(pady=5)
+
+        # Update dropdowns when frame is selected
+        self.frame_var.trace('w', self.update_signal_dropdown)
+
+    def load_dbc(self):
+        """Load DBC and update frame dropdown."""
+        if load_dbc_file():
+            self.frame_dropdown['values'] = [frame.name for frame in db.messages]
+            self.frame_dropdown['state'] = 'readonly'
+            self.frame_var.set(db.messages[0].name if db.messages else "")
+
+    def update_signal_dropdown(self, *args):
+        """Update signal dropdown based on selected frame."""
+        frame_name = self.frame_var.get()
+        if frame_name:
+            frame = next((f for f in db.messages if f.name == frame_name), None)
+            if frame:
+                self.signal_dropdown['values'] = [sig.name for sig in frame.signals]
+                self.signal_dropdown['state'] = 'readonly'
+                self.signal_var.set(frame.signals[0].name if frame.signals else "")
+            else:
+                self.signal_dropdown['values'] = []
+                self.signal_dropdown['state'] = 'disabled'
+
+    def visualize(self):
+        """Visualize the selected frame."""
+        frame_name = self.frame_var.get()
+        if frame_name:
+            visualize_frame(frame_name)
+
+    def plot_signal(self):
+        """Plot the selected signal over time."""
+        frame_name = self.frame_var.get()
+        signal_name = self.signal_var.get()
+        if frame_name and signal_name:
+            plot_signal_over_time(frame_name, signal_name)
+
+# --- Main ---
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = CANAnalyzerApp(root)
+    root.mainloop()
