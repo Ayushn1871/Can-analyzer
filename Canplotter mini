@@ -141,6 +141,8 @@ def plot_signal_over_time(frame_name, signal_name):
 
     timestamps = []
     values = []
+    choices = signal.choices if signal.choices else {}  # Get choices dictionary for conversion
+
     for msg in log:
         try:
             if msg.arbitration_id == frame.frame_id:
@@ -148,6 +150,16 @@ def plot_signal_over_time(frame_name, signal_name):
                 decoded = frame.decode(msg.data, decode_choices=False)
                 if signal_name in decoded:
                     value = decoded[signal_name]
+                    # Handle NamedSignalValue or non-numeric values
+                    if isinstance(value, cantools.database.NamedSignalValue):
+                        # Convert NamedSignalValue to numeric using choices
+                        for num, name in choices.items():
+                            if name == value:
+                                value = num
+                                break
+                        else:
+                            print(f"Skipping unknown NamedSignalValue for {signal_name}: {value}")
+                            continue
                     # Ensure value is numeric
                     if isinstance(value, (int, float)):
                         timestamps.append(msg.timestamp)
@@ -155,19 +167,22 @@ def plot_signal_over_time(frame_name, signal_name):
                     else:
                         print(f"Skipping non-numeric value for {signal_name}: {value}")
         except Exception as e:
+            print(f"Error decoding message: {e}")
             continue
 
-    if timestamps:
+    if timestamps and values:
         plt.figure(figsize=(10, 4))
         plt.plot(timestamps, values, '-o', label=signal_name)
         plt.xlabel('Time (s)')
-        plt.ylabel(signal_name)
         # Add unit if defined in DBC
         unit = signal.unit if signal.unit else "Raw Value"
         plt.ylabel(f"{signal_name} ({unit})")
         plt.title(f'Signal: {signal_name} in Frame: {frame_name}')
         plt.legend()
         plt.grid(True)
+        # If choices exist, set y-ticks to show enumerated names
+        if choices:
+            plt.yticks(list(choices.keys()), [str(choices[k]) for k in choices.keys()])
         plt.show()
     else:
         print(f"No valid numeric data found for signal {signal_name} in frame {frame_name}")
