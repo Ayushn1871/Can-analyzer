@@ -19,8 +19,11 @@ CAN_LOG_FILE = filedialog.askopenfilename(filetypes=[("CAN log files", "*.log;*.
 # --- Load the DBC ---
 db = cantools.database.load_file(DBC_FILE)
 
-# --- Read CAN log ---
-log = can.BLFReader(CAN_LOG_FILE) if CAN_LOG_FILE.endswith('.blf') else can.ASCReader(CAN_LOG_FILE)
+# --- Read CAN log into memory ---
+if CAN_LOG_FILE.endswith('.blf'):
+    log = list(can.BLFReader(CAN_LOG_FILE))
+else:
+    log = list(can.ASCReader(CAN_LOG_FILE))
 
 # --- Prepare Visualization for each message ---
 def random_color():
@@ -31,7 +34,6 @@ for frame in db.messages:
     message = None
     for msg in log:
         try:
-            decoded = db.decode_message(msg.arbitration_id, msg.data)
             frame_from_log = db.get_message_by_frame_id(msg.arbitration_id)
             if frame_from_log.name == frame.name:
                 message = msg
@@ -80,6 +82,3 @@ for frame in db.messages:
     plt.title(f'CAN Frame Layout: {frame.name}', fontsize=14)
     plt.tight_layout()
     plt.show()
-
-    # Reset the log iterator for the next frame
-    log = can.BLFReader(CAN_LOG_FILE) if CAN_LOG_FILE.endswith('.blf') else can.ASCReader(CAN_LOG_FILE)
